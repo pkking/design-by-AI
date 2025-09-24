@@ -1,135 +1,81 @@
-# 系统设计文档: GitOps CI/CD 后台系统
+# 系统设计文档: GitOps CI/CD 后台系统 (Rust + Argo Workflows)
 
 ## 1. 系统架构
 
-本系统采用微服务架构，由多个协作的后台组件构成，以实现高可用性和可扩展性。底层计算资源将由 Kubernetes 进行统一调度和管理。
+本系统以 Rust 构建后台服务，并利用 Argo Workflows 作为核心的 CI/CD 执行引擎。系统通过动态生成 Argo `Workflow` 或 `CronWorkflow` Custom Resource Definitions (CRDs) 来响应 Git 事件，将复杂的任务调度、依赖管理、资源分配和执行逻辑完全委托给 Argo。
 
 ### 1.1. 核心组件
 
-1.  **Webhook Gateway (入口网关):**
-    *   一个暴露在公网的 HTTP 服务。
-    *   **职责:** 接收来自 Git 平台的 Webhook 请求，验证请求的签名/Secret Token，将合法事件（如 Push, Pull Request）格式化后推送到消息队列。
+1.  **Webhook Gateway (Rust Service):**
+    *   一个基于 Rust (例如 Axum, Actix Web) 构建的高性能、异步 HTTP 服务。
+    *   **职责:** 接收、验证 Git Webhook 请求，并将合法的、已解析的事件推送到消息队列。
 
-2.  **Orchestrator (编排器):**
-    *   系统的核心大脑，订阅消息队列中的事件。
+2.  **Workflow Generator (Rust Service):**
+    *   **替代了原设计中的 `Orchestrator` 和 `Scheduler`。** 这是系统的核心业务逻辑所在。
     *   **职责:**
-        *   消费事件，解析仓库信息、Commit ID 等。
-        *   使用预置凭证（SSH Key 或 OAuth Token）克隆指定版本的代码。
-        *   解析仓库中的 `ci.yaml` 文件。
-        *   根据 `ci.yaml` 的定义，生成一个有向无环图 (DAG) 的任务执行计划。
-        *   对于每个待执行的任务 (Job)，向 `Scheduler` 发起调度请求。
+        *   消费消息队列中的事件。
+        *   克隆代码，解析 `ci.yaml` 文件。
+        *   **将 `ci.yaml` 的声明式配置转换为一个 Argo `Workflow` 或 `CronWorkflow` 的 YAML/JSON manifest。**
+        *   查询 `Admin Config Service` 获取 `runner` 对应的资源规格，并填充到 Workflow manifest 中。
+        *   查询 `Secret Store`，将 `secrets` 引用转换为 Argo 所支持的 Kubernetes Secret 引用。
+        *   使用 Kubernetes API Client (例如 `kube-rs`) 将生成的 Workflow manifest `apply` 到 Kubernetes 集群中。
 
-3.  **Scheduler (调度器):**
-    *   接收来自 `Orchestrator` 的任务调度请求。
+3.  **Status Reporter (Rust Service):**
     *   **职责:**
-        *   解析任务所需的 `runner` 别名，并从 `Admin Config Service` 获取对应的物理资源规格（CPU, Memory）。
-        *   解析任务所需的 `secrets` 名称，并从 `Secret Store` 获取加密后的秘钥值。
-        *   **生成一个 Kubernetes Pod 定义 (PodSpec)**，该定义包含了：
-            *   用户指定的 `image`。
-            *   转换后的 `resources` (requests/limits)。
-            *   需要注入的环境变量 (`env`) 和秘钥 (`secrets`)。
-            *   待执行的 `steps` 命令。
-        *   调用 Kubernetes API Server 创建该 Pod。
+        *   监听 Kubernetes API Server 中 `Workflow` 资源的状态变更。
+        *   或者，配置 Argo Workflows 使用 Webhook 或事件通知机制，将 `Workflow` 的状态（Running, Succeeded, Failed）推送给 `Status Reporter`。
+        *   调用 Git 平台的 API 将状态回传到对应的 Commit 或 Pull Request。
 
-4.  **Admin Config Service (管理员配置服务):**
-    *   一个内部服务，提供 API 或从中心配置文件加载配置。
-    *   **职责:** 存储并提供 `runner` 别名与物理资源规格的映射关系。
+4.  **Admin Config Service (Rust Service or Static Config):**
+    *   一个简单的 Rust 服务或由 ConfigMap 挂载的配置文件。
+    *   **职责:** 提供 `runner` 别名与物理资源规格（CPU, Memory）的映射。Argo Workflows 直接支持在 Pod 模板中定义 `resources`，因此映射非常直接。
 
-5.  **Secret Store (秘钥存储):**
-    *   一个安全的存储系统，如 HashiCorp Vault 或 Kubernetes Secrets。
-    *   **职责:** 加密存储管理员为各个仓库配置的秘钥，并提供给 `Scheduler` 在创建 Pod 时安全地注入。
+5.  **Underlying Infrastructure (底层基础设施):**
+    *   **Kubernetes Cluster:** 所有服务的运行环境。
+    *   **Argo Workflows:** 已安装并在此集群中运行的执行引擎。
+    *   **Kubernetes Secrets:** 作为默认的秘钥存储机制，与 Argo Workflows 无缝集成。
+    *   **Message Queue:** (e.g., NATS, RabbitMQ) 用于解耦 `Webhook Gateway` 和 `Workflow Generator`。
 
-6.  **Status Reporter (状态报告器):**
-    *   一个订阅任务状态变更事件的服务。
-    *   **职责:** 当任务状态（开始、成功、失败）发生变化时，调用 Git 平台的 Status API 或 Checks API，将结果回传到对应的 Commit 或 Pull Request 页面。
+### 1.2. 数据流 (Push 事件示例 with Argo)
 
-7.  **Log Collector (日志收集器):**
-    *   负责从 Kubernetes 中运行的 Pod 收集实时日志。
-    *   **职责:** 将日志流式传输到集中的日志存储系统（如 Elasticsearch, Loki），并提供一个简单的只读 API 供 Git 平台状态链接跳转查看。
+1.  开发者 `git push`。
+2.  Git 平台向 **Webhook Gateway (Rust)** 发送 Webhook。
+3.  **Gateway** 验证后将事件推入消息队列。
+4.  **Workflow Generator (Rust)** 消费事件，克隆代码，解析 `ci.yaml`。
+5.  **Generator** 开始构建一个 Argo `Workflow` manifest:
+    *   将 `ci.yaml` 中的 `jobs` 转换为 Argo DAG `templates`。
+    *   将 `job.needs` 转换为 `template.dependencies`。
+    *   对于每个 `job`，创建一个 `container` 模板。
+    *   设置 `container.image` 为 `job.image`。
+    *   设置 `container.command` 为 `["/bin/sh", "-c"]`，`args` 为 `job.run` 的脚本内容。
+    *   查询 **Admin Config Service**，将 `job.runner` 对应的资源规格填充到 `container.resources`。
+    *   将 `job.secrets` 转换为 `container.envFrom` 或 `env` 中的 `secretKeyRef`。
+6.  **Generator** 使用 `kube-rs` 客户端将完整的 `Workflow` manifest 提交到 Kubernetes API Server。
+7.  **Argo Workflows Controller** 检测到新的 `Workflow` 资源。
+8.  Argo Controller 根据 `Workflow` 定义，开始调度并创建执行器 Pods。
+9.  **Status Reporter (Rust)** 通过监听 `Workflow` 资源或接收 Argo 的回调，获取任务状态。
+10. **Reporter** 将 `Succeeded` / `Failed` 状态回传给 Git 平台。
 
-### 1.2. 数据流 (Push 事件示例)
+## 2. `ci.yaml` 到 Argo Workflow 的映射
 
-1.  开发者 `git push` 到 GitHub。
-2.  GitHub 向 **Webhook Gateway** 发送一个带有 `X-Hub-Signature` 的 POST 请求。
-3.  **Gateway** 验证签名，成功后将事件推送到消息队列 (e.g., RabbitMQ)。
-4.  **Orchestrator** 从队列中消费该事件，克隆代码。
-5.  **Orchestrator** 解析 `ci.yaml`，发现一个名为 `build-job` 的任务，该任务需要 `runner: medium` 并引用了秘钥 `DOCKER_PASSWORD`。
-6.  **Orchestrator** 向 **Status Reporter** 发送 "pending" 状态更新请求。
-7.  **Status Reporter** 调用 GitHub Checks API，在 Commit 旁显示一个黄色的 "pending" 标记。
-8.  **Orchestrator** 向 **Scheduler** 发起调度请求，包含任务元数据。
-9.  **Scheduler** 查询 **Admin Config Service** 获得 `medium` 对应的 `{"cpu": "2", "memory": "4Gi"}`。
-10. **Scheduler** 查询 **Secret Store** 获得 `DOCKER_PASSWORD` 的引用路径。
-11. **Scheduler** 构建 Pod 定义，并通过 Kubernetes API 创建 Pod。
-12. Kubernetes 在某个节点上启动该 Pod，并将秘钥作为环境变量注入。
-13. Pod 内的 Agent 开始执行 `ci.yaml` 中定义的 `steps`。日志被 **Log Collector** 收集。
-14. Pod 执行完毕，**Orchestrator** 收到完成通知（成功/失败）。
-15. **Orchestrator** 向 **Status Reporter** 发送最终状态。
-16. **Status Reporter** 调用 GitHub Checks API，将标记更新为绿色的 "success" 或红色的 "failure"。
+这是本设计的核心。我们的 `Workflow Generator` 负责执行以下转换。
 
-## 2. 核心概念定义
+| `ci.yaml` 概念 | Argo Workflow 概念 | 示例 |
+| :--- | :--- | :--- |
+| `jobs` 集合 | 一个 `Workflow` 中的 DAG `template` | `spec.templates` 中类型为 `dag` 的模板 |
+| 单个 `job` | DAG 中的一个 `task`，指向另一个执行 `template` | `dag.tasks` 中的一项 |
+| `job.needs: [a, b]` | `task.dependencies: [a, b]` | `dependencies: [build, test]` |
+| `job.image` | `container` 模板中的 `image` | `container: { image: "node:18" }` |
+| `job.runner: large` | `container` 模板中的 `resources` | `resources: { requests: { cpu: "4", memory: "16Gi" } }` |
+| `job.run: "..."` | `container` 模板中的 `script` (或 `command`/`args`) | `script: | echo "hello"` |
+| `job.secrets` | `container` 模板中的 `env` 或 `envFrom` (引用 `Secret`) | `env: - name: MY_SECRET valueFrom: { secretKeyRef: ... }` |
+| `on.schedule.cron` | 生成一个 `CronWorkflow` 资源而非 `Workflow` | `kind: CronWorkflow` |
 
-### 2.1. `ci.yaml` 文件结构
-
+**示例 `ci.yaml`:**
 ```yaml
-# ci.yaml
-
-# 定义工作流的名称
-name: My Application CI/CD
-
-# 定义触发规则
-on:
-  push:
-    branches:
-      - main
-      - develop
-  pull_request:
-    branches:
-      - main
-  schedule:
-    - cron: '0 2 * * *' # 每天凌晨2点执行
-
-# 定义任务集合
 jobs:
   build:
-    # 任务名称
-    name: Build and Test
-    # 物理资源别名
     runner: medium
-    # 运行环境的 Docker 镜像
-    image: maven:3.8-openjdk-17
-    # 环境变量
-    env:
-      MAVEN_OPTS: -Dmaven.repo.local=.m2/repository
-    # 引用的秘钥名称
-    secrets:
-      - source: SONAR_TOKEN
-        target: SONAR_LOGIN_TOKEN # 在容器内作为 SONAR_LOGIN_TOKEN 环境变量
-    # 执行步骤
+    image: golang:1.19
     steps:
-      - name: Checkout Code
-        # 'uses' 关键字可以用于引用预定义的通用操作，如代码检出
-        uses: actions/checkout@v3
-
-      - name: Build with Maven
-        run: mvn clean install
-
-      - name: Analyze with SonarQube
-        run: |
-          mvn sonar:sonar \
-            -Dsonar.host.url=https://sonarqube.example.com \
-            -Dsonar.token=$SONAR_LOGIN_TOKEN
-
-  deploy:
-    name: Deploy to Staging
-    # 'needs' 关键字定义任务依赖，确保 build 成功后才执行 deploy
-    needs: build
-    runner: small
-    image: alpine/helm:3.10
-    secrets:
-      - KUBECONFIG_STAGING
-    steps:
-      - name: Deploy with Helm
-        run: |
-          echo "$KUBECONFIG_STAGING" | base64 -d > ./kubeconfig
-          export KUBECONFIG=./kubeconfig
-          helm upgrade --install my-app ./charts/my-app
+      - run: go build ./...
