@@ -1,83 +1,68 @@
 
----
-
-### `tasks.md`
-
-```markdown
-# 任务分解: GitOps CI/CD 后台系统
-
-本文档将系统开发工作分解为多个史诗 (Epics) 和可执行的任务 (Tasks)。
+# 任务分解: GitOps CI/CD 后台系统 (Rust + Argo Workflows)
 
 ---
 
-### Epic 1: 核心执行引擎 (MVP)
+### Epic 1: 核心转换引擎 (MVP)
 
-**目标:** 能够在一个预配置的环境中，手动触发并成功执行一个最简单的 `ci.yaml` 文件。
+**目标:** 能够将一个基础的 `ci.yaml` 文件手动转换为一个有效的 Argo Workflow manifest 并通过 `kubectl` 成功执行。
 
-*   **Task 1.1:** 设计并实现 `ci.yaml` v0.1 版本的解析器 (Parser)。
-    *   *要求:* 支持 `jobs`, `image`, `steps`, `run`。
-*   **Task 1.2:** 开发一个基础的 `Orchestrator`，能够读取解析后的任务计划。
-*   **Task 1.3:** 开发一个基础的 `Scheduler`，能够接收任务并硬编码创建一个 Kubernetes Pod 来执行 `run` 命令。
-*   **Task 1.4:** 实现 Pod 内的执行 Agent，负责按顺序执行 `steps` 并捕获日志和退出码。
-*   **Task 1.5:** 建立一个基础的日志收集和存储机制，能够查看 Pod 的完整执行日志。
-
----
-
-### Epic 2: Git 平台集成与 Webhook
-
-**目标:** 系统能够接收来自 Git 平台的 Webhook，并根据事件自动触发工作流。
-
-*   **Task 2.1:** 开发 `Webhook Gateway` 服务。
-    *   *要求:* 提供一个公开的 HTTP 端点，能处理 JSON payload。
-*   **Task 2.2:** 实现 Webhook Secret Token 的验证逻辑。
-*   **Task 2.3:** 集成消息队列，将验证通过的合法事件推送到队列中。
-*   **Task 2.4:** 改造 `Orchestrator` 以消费消息队列中的事件，而非手动触发。
-*   **Task 2.5:** 实现代码克隆逻辑，能够根据 Webhook payload 中的信息拉取正确的仓库和 Commit。
-*   **Task 2.6:** 开发 `Status Reporter` 服务，实现向 Git 平台（首先支持 GitHub）回传 `pending`, `success`, `failure` 状态。
+*   **Task 1.1:** 设计并实现 `ci.yaml` v0.1 版本的 Rust 解析器 (使用 `serde`)。
+    *   *要求:* 支持 `jobs`, `image`, `run`。
+*   **Task 1.2:** 开发一个 Rust 模块，该模块能将解析后的 `ci.yaml` 结构体转换为 Argo `Workflow` 的 Rust 结构体 (使用 `k8s-openapi` 或自定义 `serde` 结构体)。
+*   **Task 1.3:** 编写一个简单的 Rust 命令行工具，输入为 `ci.yaml` 文件路径，输出为标准的 Argo `Workflow` YAML。
+*   **Task 1.4:** 部署 Argo Workflows 到开发 Kubernetes 集群。
+*   **Task 1.5:** 手动测试：使用 Task 1.3 生成的 YAML，通过 `kubectl apply -f` 确认任务能被 Argo 成功执行。
 
 ---
 
-### Epic 3: 资源管理 (Runner 别名)
+### Epic 2: Git 平台集成与自动提交
 
-**目标:** 实现用户通过别名选择物理资源，管理员可配置这些别名的功能。
+**目标:** 系统能够通过 Webhook 接收 Git 事件，并自动生成 Argo Workflow 提交到集群。
 
-*   **Task 3.1:** 设计 `runner` 别名的中心化配置文件格式。
-*   **Task 3.2:** 开发 `Admin Config Service`，能够加载并提供 `runner` 配置。
-*   **Task 3.3:** 扩展 `ci.yaml` 解析器，支持 `runner` 关键字。
-*   **Task 3.4:** 改造 `Scheduler`，使其在创建 Pod 前调用 `Admin Config Service`，获取 CPU/Memory 规格并应用到 PodSpec 的 `resources` 字段中。
-*   **Task 3.5:** 实现默认 `runner` 机制和无效 `runner` 名称的错误处理及状态回传。
-
----
-
-### Epic 4: 安全与秘钥管理
-
-**目标:** 实现一套安全的秘钥管理和注入机制。
-
-*   **Task 4.1:** 集成一个安全的秘钥存储后端 (如 HashiCorp Vault)。
-*   **Task 4.2:** 设计并开发一个安全的管理接口（API 或 CLI），供管理员添加/更新与仓库关联的秘钥。
-*   **Task 4.3:** 扩展 `ci.yaml` 解析器，支持 `secrets` 关键字。
-*   **Task 4.4:** 改造 `Scheduler`，在创建 Pod 时，从 `Secret Store` 中获取秘钥引用，并配置 PodSpec 以安全地将秘钥作为环境变量注入到容器中。
-*   **Task 4.5:** 确保在日志输出中自动屏蔽秘钥值。
+*   **Task 2.1:** 开发 `Webhook Gateway` Rust 服务。
+    *   *要求:* 提供一个公开的 HTTP 端点，能处理 JSON payload，并实现 Webhook Secret 验证。
+*   **Task 2.2:** 集成消息队列 (如 NATS)，将验证通过的事件推送到队列中。
+*   **Task 2.3:** 开发 `Workflow Generator` Rust 服务，能够消费队列事件。
+*   **Task 2.4:** 在 `Workflow Generator` 中集成代码克隆和 `ci.yaml` 解析逻辑。
+*   **Task 2.5:** 集成 `kube-rs` 客户端到 `Workflow Generator`，使其能够将生成的 `Workflow` manifest 提交到 Kubernetes。
+*   **Task 2.6:** 配置 Kubernetes RBAC，为 `Workflow Generator` 的 ServiceAccount 授予创建 `argoproj.io/workflows` 资源的权限。
+*   **Task 2.7:** 开发 `Status Reporter` Rust 服务，能够监听 `Workflow` 资源的状态变更，并调用 Git 平台 API 进行状态回传。
 
 ---
 
-### Epic 5: 增强功能与易用性
+### Epic 3: 资源与秘钥管理
 
-**目标:** 增加环境变量、任务依赖和定时触发等高级功能。
+**目标:** 实现对物理资源别名和秘钥的安全管理与使用。
 
-*   **Task 5.1:** 扩展 `ci.yaml` 解析器，支持 `env` 关键字，并实现环境变量的注入。
-*   **Task 5.2:** 扩展 `ci.yaml` 解析器，支持 `needs` 关键字。
-*   **Task 5.3:** 改造 `Orchestrator`，使其能够理解任务间的依赖关系，并按正确的顺序调度任务。
-*   **Task 5.4:** 扩展 `ci.yaml` 解析器，支持 `on.schedule.cron` 语法。
-*   **Task 5.5:** 开发一个定时任务触发器 (Cron Job)，能够定期生成事件并推送到消息队列，以触发定时工作流。
+*   **Task 3.1:** 设计并实现 `Admin Config Service` (或基于 ConfigMap 的配置加载)，用于管理 `runner` 别名。
+*   **Task 3.2:** 改造 `Workflow Generator`，使其在生成 manifest 时：
+    *   调用 `Admin Config Service` 获取资源规格。
+    *   将资源规格填充到 `container.resources` 字段。
+*   **Task 3.3:** 设计管理 Kubernetes Secrets 的流程 (例如，通过一个安全的管理脚本或内部工具)。
+*   **Task 3.4:** 改造 `Workflow Generator`，将 `ci.yaml` 中的 `secrets` 声明转换为 Argo `Workflow` 中对 Kubernetes `Secret` 的引用 (`secretKeyRef`)。
+*   **Task 3.5:** 实现对无效 `runner` 或 `secret` 名称的错误处理，并通过 `Status Reporter` 回传失败状态。
 
 ---
 
-### Epic 6: 系统运维与部署
+### Epic 4: 高级工作流功能
 
-**目标:** 确保系统可以被轻松地部署和维护。
+**目标:** 支持任务依赖、定时触发等复杂场景。
 
-*   **Task 6.1:** 为所有服务编写 Dockerfile。
-*   **Task 6.2:** 编写 Kubernetes 部署清单 (Deployments, Services, etc.) 或 Helm Chart。
-*   **Task 6.3:** 建立监控和告警系统 (e.g., Prometheus + Alertmanager)。
-*   **Task 6.4:** 编写管理员手册，说明如何部署系统、配置 `runner` 和 `secret`。
+*   **Task 4.1:** 扩展 `ci.yaml` 解析器和 `Workflow Generator`，支持 `needs` 关键字，并将其转换为 Argo DAG `dependencies`。
+*   **Task 4.2:** 扩展 `ci.yaml` 解析器，支持 `on.schedule.cron` 语法。
+*   **Task 4.3:** 改造 `Workflow Generator`，使其在检测到 `schedule` 触发时，生成 `CronWorkflow` 类型的 CRD 而不是 `Workflow`。
+*   **Task 4.4:** 配置 `Workflow Generator` 的 ServiceAccount 以拥有创建 `CronWorkflow` 资源的权限。
+*   **Task 4.5:** 实现对环境变量 (`env`) 的支持，将其直接映射到 `container.env` 字段。
+
+---
+
+### Epic 5: 系统部署与运维
+
+**目标:** 实现整个系统的自动化部署、配置和监控。
+
+*   **Task 5.1:** 为所有 Rust 服务编写 `Dockerfile` (推荐使用 multi-stage builds 减小镜像体积)。
+*   **Task 5.2:** 编写 Helm Chart 用于一键部署所有 Rust 服务及其相关配置 (ConfigMaps, RBAC, etc.)。
+*   **Task 5.3:** 编写或使用官方 Helm Chart 部署 Argo Workflows。
+*   **Task 5.4:** (推荐) 创建一个 Argo CD Application，用于以 GitOps 的方式管理本 CI/CD 系统自身的部署。
+*   **Task 5.5:** 引入日志和监控。集成 `tracing` 或 `log` crate 到 Rust 服务中，并通过 Prometheus 和 Grafana 进行监控。
